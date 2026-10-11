@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>实时昼夜壁纸（1× 顺播 + 定期对时）</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}
+  .v{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover;
+     display:block;opacity:0;z-index:1;transition:opacity .5s linear}
+  #hud{position:fixed;left:14px;bottom:12px;color:#cfe8f2;opacity:.55;
+       font:12px/1.6 "Consolas",monospace;text-shadow:0 0 6px #000;
+       background:rgba(10,16,22,.5);padding:6px 10px;border-left:2px solid #4aa3c0;
+       border-radius:2px;transition:opacity 1.2s;pointer-events:none}
+</style>
+</head>
+<body>
+<video id="a" class="v" muted playsinline preload="auto"></video>
+<video id="b" class="v" muted playsinline preload="auto"></video>
+<div id="hud">初始化…</div>
+<script>
+/* ============================================================================
+ *  realtime-timelapse-wallpaper —— 通用实时昼夜壁纸运行时
+ *  ---------------------------------------------------------------------------
+ *  一句话原理：
+ *    预先把一段「固定机位、完整昼夜循环」的延时视频切成 N 个小片段，
+ *    再用 NOAA 算法算出你所在地此刻的真实太阳高度角，把它重映射到素材自身的
+ *    太阳高度角区间，得到素材时间轴上的位置，据此选片段 + 定位，1× 原速顺播。
+ *
+ *  为什么是「1× 顺播 + 定期跳回」，而不是变速播放（核心，看不懂就看这段）：
+ *    · 要让画面进度跟上真实时间，需要的倍率 ≈ 24h ÷ 素材时长。素材若只有几分钟，
+ *      倍率就是几百倍，画面会像 PPT 一样一格一格地蹦，完全不像「实时」。
+ *      只有把素材拉长到几小时，1× 才看起来像实拍在走。
+ *    · 变速播放还要求素材的昼长恰好等于你所在地今天的真实昼长，否则日出日落
+ *      永远对不上（同一段素材不可能适配所有季节、所有纬度）。
+ *    本方案反过来做：让素材始终 1× 原速顺播（画面流畅、像实时），同时在后台
+ *    一直比较「画面所处时刻」和「真实时刻」；偏差没超过阈值就不动它，一旦超过
+ *    阈值，就用一次 0.3 秒的叠化把画面「跳回」正确位置。误差被限制在一个小
+ *    区间内来回摆动，而那一次跳跃被叠化藏掉了 —— 这就是用一小段素材撑起一整天
+ *    的关键技巧：空间（素材长度）换时间（真实时长），再定期「校表」。
+ *
+ *  数据流（详见 README.md）：
+ *    真实时间 ─(NOAA)─> 真实太阳高度角 A
+ *            ─(重映射)─> 素材自身太阳高度角 A'
+ *            ─(素材日晷反解)─> 素材时间轴位置 v
+ *            ─> 选片段 chunkIndexFor(v) + 片段内偏移 (v - BOUNDS[k])
+ * ==========================================================================*/
+
+/* ============================================================================
+ *  CONFIG —— 素材标定与播放参数（换素材时，基本只需要改这一段）
+ *  所有 BOUNDS / V_* / LOOP 的数值都来自对你自己素材的标定，
+ *  标定方法见 README.md「如何标定素材」以及 tools/measure-calibration.py。
+ *  下面这组数值是「示例值」（对应一段夏日昼夜循环素材），换素材后必须替换！
+ * ==========================================================================*/
+
+/* ---- 1) 素材切块：把长视频等长切成 N 块 chunks/000.mp4 … ----------------
+ *   每块时长 CHUNK_SECONDS（秒），块数 NCHUNK，总长 LOOP = 各块时长之和。
+ *   tools/cut-video.py 会直接打印出这三个值，复制过来即可。              */
+const CHUNK_SECONDS = 125;        // 每块时长（秒）——示例：约等长 125s
+const NCHUNK        = 96;         // 块数 —— 示例：切成 96 块
+const LOOP          = 11489.4;    // 素材总时长（秒）＝原片时长；也是「一整天」在素材轴上走过的长度
+
+/* BOUNDS：NCHUNK+1 个块边界（秒）。BOUNDS[i] 是第 i 块的起点、BOUNDS[i+1] 是终点，
+ * 起点即上一块的终点。由 cut-video.py 打印，整行粘进来即可。              */
+const BOUNDS  = [0,125,241.67,366.67,483.33,600,725,841.67,958.33,1083.33,1200,1316.67,1441.67,1558.33,1683.33,1800,1916.67,2041.67,2158.33,2275,2400,2516.67,2633.33,2758.33,2875,3000,3116.67,3233.33,3358.33,3475,3591.67,3716.67,3833.33,3950,4075,4191.67,4316.67,4433.33,4550,4675,4791.67,4908.33,5033.33,5150,5266.67,5391.67,5508.33,5625,5750,5866.67,5991.67,6108.33,6225,6350,6466.67,6583.33,6708.33,6825,6941.67,7066.67,7183.33,7308.33,7425,7541.67,7666.67,7783.33,7900,8025,8141.67,8258.33,8383.33,8500,8625,8741.67,8858.33,8983.33,9100,9216.67,9341.67,9458.33,9575,9700,9816.67,9941.67,10058.33,10175,10300,10416.67,10533.33,10658.33,10775,10891.67,11016.67,11133.33,11250,11375,11489.4];
+
+/* ---- 2) 昼夜相位标定：素材里「日落 / 午夜 / 日出」分别在第几秒 ----------
+ *   去素材里肉眼找到（可用 tools/measure-calibration.py 辅助定位）：
+ *     V_SET  = 画面开始明显变暗（日落）那一刻的素材秒数
+ *     V_MID  = 画面最暗（午夜）那一刻的素材秒数
+ *     V_RISE = 画面开始明显变亮（日出）那一刻的素材秒数
+ *   这三个是整套映射的「锚点」。标定不准，画面就会和真实时间整体错位。   */
+const V_SET  = 2915;              // 日落（画面转暗的拐点）在素材轴上的秒数
+const V_MID  = 5255;              // 午夜（画面最暗处）在素材轴上的秒数
+const V_RISE = 7599;              // 日出（画面转亮的拐点）在素材轴上的秒数
+
+/* DUSK_LEN / DAWN_LEN：日落→全黑、全黑→日出 各占多少素材秒（实测值）。
+ *   用于把真实的「黄昏 / 黎明」段按比例铺到素材上，让暮色过渡快慢也对得上。 */
+const DUSK_LEN = 1435;            // 素材实测：黄昏段长度（日落 → 全黑），单位秒
+const DAWN_LEN = 713;             // 素材实测：黎明段长度（全黑 → 日出），单位秒
+
+/* ---- 3) 素材自身的「太阳」模型 -----------------------------------------
+ *   素材拍在某天某个纬度，白昼长度是已知的。由昼长可以反推「素材纬度 + 太阳赤纬」：
+ *     昼长 H 小时  →  时角半宽 hA = H × 15 / 2 度，且 cos(hA) = -tan(纬度)·tan(赤纬)
+ *   一个方程两个未知数，解不出来，所以再补一个假设（见 README「如何标定素材」）：
+ *   通常先假定拍摄当天的太阳赤纬（按拍摄季节查表），再反推纬度；或反过来。
+ *   本例素材 ≈ 北纬 41.8°、太阳赤纬 +18°（夏日）→ 素材世界正午高度角 66.2°。
+ *   ★ 只有这两个数决定「素材画面里太阳走得快还是慢」，换素材务必重新标定。 */
+const V_LAT  = 41.8;              // 素材纬度（度，北纬为正）
+const V_DECL = 18;                // 素材拍摄当天的太阳赤纬（度）
+
+/* ---- 4) 默认观察者位置（示例坐标，可在壁纸属性面板里改） --------------
+ *   这两项只决定「你所在地的日出 / 日落时刻」，与素材本身无关。
+ *   示例给了加州海岸一组坐标，仅作演示，请填写你自己所在城市。
+ *   支持写法：35.3 / 39.9042N / 33.87S / 151.2093E / -120.85          */
+let LAT = 35.30, LON = -120.85;
+
+/* ---- 5) 对时与叠化参数（一般不必改） ----------------------------------
+ *   画面不是把此刻钉死的，而是 1× 顺播、偏差累计超过阈值才跳一次；
+ *   这组参数控制「多久跳一次、跳的时候过渡多久」。                       */
+const DRIFT_MAX      = 45*60;     // 「现实偏差」上限（秒）——仅用于 HUD 显示；超过说明该对时了
+const DRIFT_MAX_VID  = 400;       // 「画面偏差」上限（素材秒）——真正触发对时的阈值，日夜频率一致
+const XFADE          = 0.5;       // 片段与片段接缝处的叠化时长（秒）
+const XFADE_DRIFT    = 0.3;       // 偏差超限那次对时的叠化时长（秒）
+const XFADE_SYNC     = 3.0;       // 手动改「时间偏移 / 位置」后那次对时的叠化时长（秒）
+const XFADE_WAKE_LONG= 0.3;       // 长时间离开后回来那次对时的叠化时长（秒）
+const WAKE_CUT       = 15*60;     // 离开时长分界（秒）：≤它 → 接着播；>它 → 对时
+const LEAD           = 15;        // 距本片段结束多少秒开始预载下一段
+const IDLE_MAX       = 30;        // 暂停超过多少秒算「离开了」
+const AWAY_PRELOAD   = 15*60;     // 离开状态下每隔多少秒刷新一次预载
+const VIDEO_FPS      = 30;        // 素材帧率（仅作文档参考；本运行时不做变速，不需要它）
+
+/* ===================== 观察者时区（三档） =====================
+   'auto'   —— 跟随本机时区（夏令时由系统处理）
+   'lookup' —— 按经纬度联网查询（timeapi.io：返回 IANA 时区名 + 当前 UTC 偏移，含夏令时）
+   'manual' —— 固定偏移 TZ_MANUAL_MIN                                       */
+let TZ_MODE       = 'auto';
+let TZ_MANUAL_MIN = null;   // manual：固定偏移（分钟）
+let TZ_LOOK_MIN   = null;   // lookup：查询到的偏移（分钟）
+let TZ_LOOK_NAME  = '';     // lookup：IANA 时区名，如 Asia/Shanghai
+let TZ_LOOK_DST   = false;  // lookup：该地当前是否在用夏令时
+let tzShiftH      = 0;      // 地点当地时 − 本机当地时（小时）
+
+function sysOffMin(){ return -new Date().getTimezoneOffset(); }
+/* 按经度粗估（15°=1h，忽略时区政治边界，仅作查询失败时的兜底） */
+function estimateOffMin(){ return Math.round(LON/15)*60; }
+function locOffMin(){
+  if (TZ_MODE === 'manual' && TZ_MANUAL_MIN !== null) return TZ_MANUAL_MIN;
+  if (TZ_MODE === 'lookup') return TZ_LOOK_MIN !== null ? TZ_LOOK_MIN : estimateOffMin();
+  return sysOffMin();
+}
+function fmtOff(m){
+  const s = m < 0 ? '-' : '+', a = Math.abs(m);
+  return s + Math.floor(a/60) + (a%60 ? ':' + pad2(a%60) : '');
+}
+function tzLabel(){
+  if (TZ_MODE === 'auto')   return '本机时区';
+  if (TZ_MODE === 'manual') return 'UTC' + fmtOff(TZ_MANUAL_MIN === null ? 0 : TZ_MANUAL_MIN);
+  if (TZ_LOOK_MIN !== null)
+    return (TZ_LOOK_NAME ? TZ_LOOK_NAME + '  ' : '') + 'UTC' + fmtOff(TZ_LOOK_MIN)
+         + (TZ_LOOK_DST ? '（夏令时）' : '');
+  return 'UTC' + fmtOff(estimateOffMin()) + '（估算·查询中）';
+}
+function updateTzShift(){ tzShiftH = (locOffMin() - sysOffMin())/60; }
+updateTzShift();
+
+/* 解析经纬度文本；非法输入返回 NaN */
+function parseCoord(s, kind){
+  if (s === null || s === undefined) return NaN;
+  let t = String(s).trim().toUpperCase().replace(/[°\s]/g, '');
+  if (!t) return NaN;
+  let sign = 1;
+  if (/[SW]$/.test(t)){ sign = -1; t = t.slice(0, -1); }
+  else if (/[NE]$/.test(t)){ t = t.slice(0, -1); }
+  const v = parseFloat(t);
+  if (!isFinite(v)) return NaN;
+  if (Math.abs(v) > (kind === 'lat' ? 90 : 180)) return NaN;
+  return sign*v;
+}
+
+/* ===================== 联网查时区 =====================
+   接口：https://timeapi.io/api/TimeZone/coordinate?latitude=..&longitude=..
+   返回 IANA 时区名 + currentUtcOffset.seconds（含夏令时）+ isDayLightSavingActive
+   结果按坐标缓存 6 小时（夏令时切换最多一年两次，6 小时足够）；
+   查询失败 → 退到上次缓存 → 再退到按经度估算（HUD 会标明「估算」）       */
+const TZ_CACHE_KEY = 'tzLookup', TZ_TTL = 6*3600*1000, TZ_TIMEOUT = 9000;
+let tzLookSeq = 0;
+
+function tzCacheGet(lat, lon){
+  try {
+    const o = JSON.parse(localStorage.getItem(TZ_CACHE_KEY) || '{}');
+    const e = o[lat.toFixed(2) + ',' + lon.toFixed(2)];
+    if (e && (Date.now() - e.t) < TZ_TTL) return e;
+  } catch (e) {}
+  return null;
+}
+function tzCachePut(lat, lon, val){
+  try {
+    const o = JSON.parse(localStorage.getItem(TZ_CACHE_KEY) || '{}');
+    o[lat.toFixed(2) + ',' + lon.toFixed(2)] = { t: Date.now(), off: val.off, zone: val.zone, dst: val.dst };
+    const ks = Object.keys(o);
+    if (ks.length > 20){                       // 只留最近 20 条
+      ks.sort(function(a,b){ return o[a].t - o[b].t; })
+        .slice(0, ks.length - 20).forEach(function(k){ delete o[k]; });
+    }
+    localStorage.setItem(TZ_CACHE_KEY, JSON.stringify(o));
+  } catch (e) {}
+}
+function applyTzResult(off, zone, dst){
+  TZ_LOOK_MIN = off; TZ_LOOK_NAME = zone || ''; TZ_LOOK_DST = !!dst;
+  updateTzShift();
+  resync(XFADE_SYNC);
+  hudUpdate();
+  hud.style.opacity = 1;
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(function(){ hud.style.opacity = 0; }, 9000);
+}
+function lookupTz(){
+  if (TZ_MODE !== 'lookup') return;
+  const lat = LAT, lon = LON, seq = ++tzLookSeq;
+  const c = tzCacheGet(lat, lon);
+  if (c){ applyTzResult(c.off, c.zone, c.dst); return; }
+  TZ_LOOK_NAME = ''; TZ_LOOK_MIN = null;       // 先回落到经度估算
+  updateTzShift(); hudUpdate();
+  let ctrl = null, to = 0;
+  try { ctrl = new AbortController(); to = setTimeout(function(){ ctrl.abort(); }, TZ_TIMEOUT); } catch (e) {}
+  fetch('https://timeapi.io/api/TimeZone/coordinate?latitude=' + lat + '&longitude=' + lon,
+        { cache:'no-store', signal: ctrl ? ctrl.signal : undefined })
+    .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(j){
+      clearTimeout(to);
+      if (seq !== tzLookSeq) return;                       // 结果已过期（坐标又改了）
+      const off = Math.round(j.currentUtcOffset.seconds / 60);
+      tzCachePut(lat, lon, { off:off, zone:j.timeZone || '', dst:j.isDayLightSavingActive });
+      applyTzResult(off, j.timeZone, j.isDayLightSavingActive);
+    })
+    .catch(function(){
+      clearTimeout(to);
+      if (seq !== tzLookSeq) return;                       // 失败：保持经度估算，HUD 会标「估算」
+      resync(XFADE_SYNC); hudUpdate();
+    });
+}
+
+let offsetHours = 0;
+
+/* 临时预览：把画面钉在“日出/日落 ± PREVIEW_MIN 分钟”，方便查看某一时刻的效果。
+   看完把 PREVIEW_ON 改回 false 即可恢复“跟随现实时间”。            */
+const PREVIEW_ON     = false; // 预览开关：true 时画面固定在基准时刻附近，false = 跟随现实时间
+const PREVIEW_ANCHOR = 'set'; // 'rise' = 以日出为基准；'set' = 以日落为基准
+const PREVIEW_MIN    = 0;     // 相对基准的分钟数：0=日落当时，-25=日落前 25 分钟，+15=日落后 15 分钟
+let previewShift     = 0;     // 自动算出的偏移（小时），无需手填
+
+/* ===================== 太阳时刻（NOAA） ===================== */
+function sunTimes(d){
+  const rad = Math.PI/180;
+  const doy = Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())
+                          - Date.UTC(d.getFullYear(), 0, 0)) / 86400000);
+  const g = 2*Math.PI/365*(doy - 1 + 0.5);
+  const eqtime = 229.18*(0.000075 + 0.001868*Math.cos(g) - 0.032077*Math.sin(g)
+                - 0.014615*Math.cos(2*g) - 0.040849*Math.sin(2*g));
+  const decl = 0.006918 - 0.399912*Math.cos(g) + 0.070257*Math.sin(g)
+             - 0.006758*Math.cos(2*g) + 0.000907*Math.sin(2*g)
+             - 0.002697*Math.cos(3*g) + 0.001480*Math.sin(3*g);
+  const latR = LAT*rad;
+  let cosHa = Math.cos(90.833*rad)/(Math.cos(latR)*Math.cos(decl)) - Math.tan(latR)*Math.tan(decl);
+  cosHa = Math.max(-1, Math.min(1, cosHa));
+  const haDeg = Math.acos(cosHa)/rad;
+  const tz = locOffMin();
+  const noonUTC = 720 - 4*LON - eqtime;
+  const norm = m => ((m*60 % 86400) + 86400) % 86400;
+  return { rise: norm(noonUTC - 4*haDeg + tz),
+           noon: norm(noonUTC + tz),
+           set:  norm(noonUTC + 4*haDeg + tz) };
+}
+
+/* ===================== 太阳高度角（真实，NOAA） ===================== */
+function sunParams(d){
+  const doy = Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())
+                          - Date.UTC(d.getFullYear(), 0, 0)) / 86400000);
+  const g = 2*Math.PI/365*(doy - 1 + 0.5);
+  return {
+    eqtime: 229.18*(0.000075 + 0.001868*Math.cos(g) - 0.032077*Math.sin(g)
+           - 0.014615*Math.cos(2*g) - 0.040849*Math.sin(2*g)),
+    decl:   0.006918 - 0.399912*Math.cos(g) + 0.070257*Math.sin(g)
+           - 0.006758*Math.cos(2*g) + 0.000907*Math.sin(2*g)
+           - 0.002697*Math.cos(3*g) + 0.001480*Math.sin(3*g)
+  };
+}
+function secOfDay(d){ return d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds() + d.getMilliseconds()/1000; }
+function sunAltRad(d){
+  const rad = Math.PI/180, sp = sunParams(d);
+  let tst = (secOfDay(d)/60 + sp.eqtime + 4*LON - locOffMin()) % 1440;
+  if (tst < 0) tst += 1440;                                  // 真太阳时（分钟）
+  const ha = (tst/4 - 180)*rad, latR = LAT*rad;              // 时角（上午为负）
+  const sinA = Math.sin(latR)*Math.sin(sp.decl) + Math.cos(latR)*Math.cos(sp.decl)*Math.cos(ha);
+  return Math.asin(Math.max(-1, Math.min(1, sinA)));
+}
+
+/* ===================== 素材自身的“日晷”模型 =====================
+   把素材看作「某个纬度的某一天」：由 CONFIG 里的 V_LAT / V_DECL 可以算出素材
+   每一帧对应它自己世界的太阳高度角；把真实太阳高度角一一对应上去，
+   素材的昼夜就被“等比例”缩放到今天：
+     · 日出 / 日落仍精确落在真实时刻（模型的两个锚点按 -0.833° 定义）
+     · 黎明 / 黄昏 / 正午的快慢比例与真实太阳一致，而不是在锚点之间线性拉伸   */
+const V_LAT_R  = V_LAT*Math.PI/180, V_DECL_R = V_DECL*Math.PI/180;
+const V_SIN    = Math.sin(V_LAT_R)*Math.sin(V_DECL_R);
+const V_COS    = Math.cos(V_LAT_R)*Math.cos(V_DECL_R);
+const RISE_ALT = -0.833*Math.PI/180;                         // 日出/日落时太阳高度角
+const V_HA_HALF = Math.acos(Math.max(-1, Math.min(1, (Math.sin(RISE_ALT) - V_SIN)/V_COS)));
+const V_NOON   = V_RISE + ((LOOP - V_RISE) + V_SET)/2;       // 素材正午位置
+const TAU      = 2*Math.PI;
+
+/* 反解：真实太阳高度角 + 是否“上午侧” → 素材位置 */
+function vidPosFor(altRad, first){
+  const k = Math.max(-1, Math.min(1, (Math.sin(altRad) - V_SIN)/V_COS));
+  const ha = first ? TAU - Math.acos(k) : TAU + Math.acos(k);
+  const s1 = TAU - V_HA_HALF, s2 = TAU, s3 = TAU + V_HA_HALF, s4 = TAU + Math.PI;
+  if (ha < s1) return V_MID   + (ha - Math.PI)/(s1 - Math.PI)*(V_RISE - V_MID);
+  if (ha < s2) return V_RISE  + (ha - s1)/(s2 - s1)*(V_NOON - V_RISE);
+  if (ha < s3) return V_NOON  + (ha - s2)/(s3 - s2)*((V_SET + LOOP) - V_NOON);
+  return (V_SET + LOOP) + (ha - s3)/(s4 - s3)*((V_MID + LOOP) - (V_SET + LOOP));
+}
+
+/* ===================== 现实时间 -> 素材时间轴位置 =====================
+   按“日晷”映射：取真实太阳高度角，算出它在【本相位】内走了百分之几，
+   再让素材在【素材世界对应相位】内也走同样的百分比。
+   这就是把素材的昼夜“等比例缩放”到今天的真实太阳轨迹：
+     · 日出 / 日落 / 正午 / 午夜四个锚点仍精确落在真实时刻
+     · 黎明、黄昏、正午的快慢比例跟随真实太阳（不再在锚点间线性拉伸）   */
+const RISE_ALT_D   = -0.833;                        // 日出/日落时的太阳高度角（度）
+const VID_NOON_ALT = 90 - Math.abs(V_LAT - V_DECL); // 素材世界正午高度角（示例为 66.2°）
+const TWILIGHT     = -18;                           // 天文暮光（太阳 -18°）：真实黄昏/黎明的分界
+function vidPosForDeg(altDeg, first){ return vidPosFor(altDeg*Math.PI/180, first); }
+function scaleAlt(A, a0, a1, b0, b1){              // 把 A 在 [a0,a1] 中的比例搬到 [b0,b1]
+  const f = (a1 === a0) ? 0 : (A - a0)/(a1 - a0);
+  return b0 + f*(b1 - b0);
+}
+function clamp01(x){ return x < 0 ? 0 : (x > 1 ? 1 : x); }
+function videoTimeFor(now){
+  const d = new Date(now.getTime() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const sec = secOfDay(d);
+  const s = sunTimes(d), sp = sunParams(d);
+  const declD = sp.decl*180/Math.PI;
+  const A = sunAltRad(d)*180/Math.PI;                       // 真实高度角（度）
+  const A_noon = 90 - Math.abs(LAT - declD);                // 今日正午高度角
+  const A_min  = -(90 - LAT - declD);                       // 今日午夜高度角
+  const mid = s.set + (s.rise + 86400 - s.set)/2;           // 太阳午夜（秒，可能 > 86400）
+  if (sec >= s.rise && sec < s.noon)                        // 上午：日出 → 正午
+    return vidPosForDeg(scaleAlt(A, RISE_ALT_D, A_noon, RISE_ALT_D, VID_NOON_ALT), true);
+  if (sec >= s.noon && sec < s.set)                         // 下午：正午 → 日落
+    return vidPosForDeg(scaleAlt(A, A_noon, RISE_ALT_D, VID_NOON_ALT, RISE_ALT_D), false);
+  const DUSK0 = V_SET + LOOP, MID0 = V_MID + LOOP, DAWN0 = V_RISE + LOOP - DAWN_LEN;
+  let sec2 = sec; if (sec2 < s.set) sec2 += 86400;
+  if (sec2 < mid){                                          // 前半夜：日落 → 太阳午夜
+    if (A > TWILIGHT)                                       //   黄昏段（−0.833° → −18°）
+      return DUSK0 + clamp01((RISE_ALT_D - A)/(RISE_ALT_D - TWILIGHT))*DUSK_LEN;
+    return (DUSK0 + DUSK_LEN) +                            //   深夜段（−18° → 午夜）
+           clamp01((TWILIGHT - A)/(TWILIGHT - A_min))*(MID0 - (DUSK0 + DUSK_LEN));
+  }
+  if (A < TWILIGHT)                                         // 后半夜：午夜 → 拂晓
+    return MID0 + clamp01((A_min - A)/(A_min - TWILIGHT))*(DAWN0 - MID0);
+  return DAWN0 +                                            // 黎明段（−18° → 日出）
+         clamp01((TWILIGHT - A)/(TWILIGHT - RISE_ALT_D))*DAWN_LEN;
+}
+function chunkIndexFor(v){
+  v = ((v % LOOP) + LOOP) % LOOP;
+  for (let i = 0; i < NCHUNK; i++) if (v < BOUNDS[i+1]) return i;
+  return NCHUNK - 1;
+}
+/* 反查：某个素材位置“相当于现实几点”（返回当天秒数）——上文的映射取逆 */
+function realSecFor(v){
+  const d = new Date(Date.now() + tzShiftH*3600000), sp = sunParams(d);
+  const s = sunTimes(d);
+  const declD = sp.decl*180/Math.PI;
+  const A_noon = 90 - Math.abs(LAT - declD), A_min = -(90 - LAT - declD);
+  const mid = s.set + (s.rise + 86400 - s.set)/2;
+  const DUSK0 = V_SET + LOOP, MID0 = V_MID + LOOP, DAWN0 = V_RISE + LOOP - DAWN_LEN;
+  let x = ((v % LOOP) + LOOP) % LOOP;
+  if (x < V_MID) x += LOOP;
+  let A, t0, t1, rising;
+  if (x < V_RISE){                                          // 后半夜：深夜 → 黎明
+    A = x < (DAWN0 - LOOP) ? scaleAlt(x, MID0 - LOOP, DAWN0 - LOOP, A_min, TWILIGHT)
+                           : scaleAlt(x, DAWN0 - LOOP, V_RISE, TWILIGHT, RISE_ALT_D);
+    t0 = mid; t1 = s.rise + 86400; rising = true;
+  } else if (x < V_NOON){                                   // 上午：日出 → 正午
+    A = scaleAlt(x, V_RISE, V_NOON, RISE_ALT_D, A_noon);
+    t0 = s.rise; t1 = s.noon; rising = true;
+  } else if (x < DUSK0){                                    // 下午：正午 → 日落
+    A = scaleAlt(x, V_NOON, DUSK0, A_noon, RISE_ALT_D);
+    t0 = s.noon; t1 = s.set; rising = false;
+  } else {                                                  // 前半夜：黄昏 → 深夜
+    A = x < DUSK0 + DUSK_LEN ? scaleAlt(x, DUSK0, DUSK0 + DUSK_LEN, RISE_ALT_D, TWILIGHT)
+                             : scaleAlt(x, DUSK0 + DUSK_LEN, MID0, TWILIGHT, A_min);
+    t0 = s.set; t1 = mid; rising = false;
+  }
+  let lo = t0, hi = t1;                                     // 相位内高度角单调 → 二分反解
+  for (let i = 0; i < 30; i++){
+    const m = (lo + hi)/2;
+    const dm = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    dm.setSeconds(Math.floor(m));
+    const am = sunAltRad(dm)*180/Math.PI;
+    if ((am < A) === rising) lo = m; else hi = m;
+  }
+  return ((lo + hi)/2) % 86400;
+}
+/* 画面时刻与现实时刻的偏差（秒，带符号，归到 ±12 小时内）。
+   基准用“加了时间偏移的现实时间”，否则拖偏移会被当成偏差、导致反复对时 */
+function driftSec(){
+  if (chunk < 0) return 0;
+  const implied = realSecFor(wrapTime(BOUNDS[chunk] + act().currentTime));
+  const d = new Date(Date.now() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const nowSec = d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds() + d.getMilliseconds()/1000;
+  let diff = implied - nowSec;
+  while (diff >  43200) diff -= 86400;
+  while (diff < -43200) diff += 86400;
+  return diff;
+}
+/* 画面偏差（素材秒，带符号、取最短方向）——对时阈值用它。
+   现实偏差（上面那个）会随映射疏密剧烈变化：夜里 1 素材秒 ≈ 1~2 分钟现实时间，
+   用它当阈值会让夜里每 50 秒就对一次时。用“画面走了多远”当阈值则日夜一致。 */
+function driftVid(){
+  if (chunk < 0) return 0;
+  const pos = BOUNDS[chunk] + act().currentTime;
+  const tgt = wrapTime(videoTimeFor(new Date()));
+  return ((pos - tgt) % LOOP + LOOP*1.5) % LOOP - LOOP/2;
+}
+
+/* ===================== 对时计数（按天，写 localStorage，页面重载也不丢） ===================== */
+const DAY_KEY = (function(){ const d = new Date(Date.now() + tzShiftH*3600000); return d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate(); })();
+let resyncN = 0, resyncLog = [];
+(function loadStat(){
+  try {
+    const o = JSON.parse(localStorage.getItem('resyncStat') || 'null');
+    if (o && o.day === DAY_KEY){ resyncN = o.n || 0; resyncLog = o.log || []; }
+  } catch (e) {}                                     // file:// 下不允许时静默降级
+})();
+function logResync(kind){
+  resyncN++;
+  resyncLog.push({ t: Date.now(), k: kind, dr: Math.round(driftSec()/60) });
+  if (resyncLog.length > 300) resyncLog = resyncLog.slice(-300);
+  try { localStorage.setItem('resyncStat', JSON.stringify({ day: DAY_KEY, n: resyncN, log: resyncLog })); } catch (e) {}
+}
+
+/* ===================== 播放引擎（双缓冲） ===================== */
+const EL = [document.getElementById('a'), document.getElementById('b')];
+const hud = document.getElementById('hud');
+let active = 0;        // 当前在播的元素
+let chunk  = -1;       // 当前块号
+let busy   = false;    // 正在切换中
+let prepped = -1;      // 已预载到待用元素的块号
+
+function url(k){ return 'chunks/' + String(k).padStart(3,'0') + '.mp4'; }
+function act(){ return EL[active]; }
+function std(){ return EL[1-active]; }
+
+/* 把第 k 块载入待用元素、从 offset 秒开始播，并与当前画面叠化 xfade 秒 */
+function play(k, offset, xfade){
+  if (busy) return;
+  busy = true;
+  const n = std(), o = act();
+  n.loop = false;
+  n.onerror = function(){
+    hud.style.opacity = 1;
+    hud.textContent = '片段加载失败 ' + url(k) + '：' + (n.error ? (n.error.message || n.error.code) : '未知');
+    busy = false;
+  };
+  let done = false;
+  /* 关键：新图层压在上面淡入，旧图层全程保持不透明。
+     两张都是不透明画面，叠加结果 = 新*alpha + 旧*(1-alpha)，永远不会掉到黑色。 */
+  const beginFade = function(){
+    if (done) return;
+    done = true;
+    n.style.zIndex = 3;
+    n.style.transitionDuration = xfade + 's';
+    n.style.opacity = 1;
+    active = 1 - active; chunk = k; prepped = -1;
+    setTimeout(function(){
+      try { o.pause(); } catch (e) {}
+      o.style.transitionDuration = '0s';
+      o.style.opacity = 0;
+      o.style.zIndex = 1;
+      n.style.zIndex = 2;
+      n.style.transitionDuration = '0s';
+      busy = false;
+    }, xfade*1000 + 100);
+  };
+  const startPlay = function(){
+    n.oncanplay = null; n.onseeked = null;
+    try { n.playbackRate = 1; } catch (e) {}
+    const pr = n.play();
+    // 必须等新图层真的吐出第一帧才开始淡入，否则会先黑一下
+    let gated = false;
+    const gate = function(){ if (gated) return; gated = true; beginFade(); };
+    if (n.requestVideoFrameCallback){
+      n.requestVideoFrameCallback(gate);
+      setTimeout(gate, 500);
+    } else {
+      setTimeout(gate, 150);
+    }
+    if (pr && pr.catch) pr.catch(gate);
+  };
+  const afterReady = function(){
+    n.oncanplay = null;
+    if (offset > 0.3){ n.onseeked = startPlay; n.currentTime = offset; }
+    else startPlay();
+  };
+  n.oncanplay = afterReady;
+  if (prepped === k && n.getAttribute('src') === url(k) && n.readyState >= 2){
+    prepped = -1;
+    afterReady();
+  } else {
+    prepped = -1;
+    n.setAttribute('src', url(k));
+    n.load();
+  }
+}
+
+/* 对时：跳到“当前真实时段”对应的那块 */
+function wrapTime(v){ return ((v % LOOP) + LOOP) % LOOP; }
+function resync(xfade){
+  if (busy || chunk < 0) return;
+  const v = wrapTime(videoTimeFor(new Date()));
+  const k = chunkIndexFor(v);
+  play(k, v - BOUNDS[k], (xfade === undefined ? XFADE_SYNC : xfade));
+}
+
+/* 从「离开」状态回来：
+   · 短离开（≤ WAKE_CUT）：不跳，接着往下播——偏差由 driftSec() 记录着，累计超限时再对时
+   · 长离开（> WAKE_CUT）：0.3 秒叠化跳回当前时段 */
+function wakeUp(away){
+  awayAt = 0;                                        // 复位离开计时，下次离开重新算
+  const a = act();
+  if (away <= WAKE_CUT){
+    if (a.paused && a.readyState >= 2){
+      const p = a.play();
+      if (p && p.catch) p.catch(function(){});
+    }
+  } else {
+    logResync('wake');
+    resync(XFADE_WAKE_LONG);
+  }
+}
+
+/* 离开状态（壁纸没在显示）下，每 AWAY_PRELOAD 秒把「当前时段」那块预载到待用图层，
+   这样回来时那一块已经载好、解码器也是热的，几乎零延迟。 */
+let awayAt = 0;
+function awayPreload(){
+  const now = Date.now();
+  if (now - awayAt < AWAY_PRELOAD*1000) return;
+  awayAt = now;
+  if (busy || chunk < 0) return;
+  const v = wrapTime(videoTimeFor(new Date()));
+  const k = chunkIndexFor(v);
+  const s = std();
+  const want = url(k);
+  if (k === chunk || s.getAttribute('src') === want) return;  // 现成可用，不必重复载
+  try { s.pause(); } catch (e) {}
+  s.loop = false;
+  s.setAttribute('src', want);
+  s.load();
+  prepped = k;
+  s.oncanplay = function(){                          // 预热：解出第一帧再暂停
+    s.oncanplay = null;
+    const chill = function(){ setTimeout(function(){ try { s.pause(); } catch (e) {} }, 260); };
+    const p = s.play();
+    if (p && p.then) p.then(chill).catch(chill); else chill();
+  };
+}
+
+/* 顺播：接近块尾时预载下一块，并在接缝处叠化过去 */
+function forward(){
+  if (busy || chunk < 0) return;
+  const a = act();
+  const nx = (chunk + 1) % NCHUNK;
+  if (a.ended){ play(nx, 0, XFADE); return; }
+  if (!isFinite(a.duration) || a.duration <= 0 || a.paused) return;
+  const remain = a.duration - a.currentTime;
+  if (remain <= LEAD && prepped < 0){
+    const s = std();
+    try { s.pause(); } catch (e) {}
+    s.loop = false;
+    s.setAttribute('src', url(nx));
+    s.load();
+    prepped = nx;
+    // 预热：提前让它解出第一帧再暂停，接缝切换时才不会出现黑屏
+    s.oncanplay = function(){
+      s.oncanplay = null;
+      const chill = function(){ setTimeout(function(){ try { s.pause(); } catch (e) {} }, 260); };
+      const p = s.play();
+      if (p && p.then) p.then(chill).catch(chill); else chill();
+    };
+  }
+  if (remain <= XFADE) play(nx, 0, XFADE);
+}
+setInterval(forward, 250);
+
+/* ===================== 计时：偏差超限就对时 ===================== */
+let lastTickAt = Date.now(), lastRafAt = Date.now();
+let idle = 0;
+(function rafLoop(){ lastRafAt = Date.now(); requestAnimationFrame(rafLoop); })();
+
+function tick1s(){
+  const now = Date.now();
+  const gap = (now - lastTickAt) / 1000; lastTickAt = now;
+  const rendering = (now - lastRafAt) < 1300;               // 壁纸真的在显示吗
+  const awake = rendering && chunk >= 0;
+  if (!awake){
+    idle += gap;                                            // 没在显示：只累计离开时长
+    awayPreload();                                          // 离开期间每 15 分钟刷新一次预载
+  } else if (idle + gap > IDLE_MAX){
+    // 刚回来（或显示着却停了很久）：
+    if (!busy){ const away = idle + gap; idle = 0; wakeUp(away); }
+  } else if (!act().paused && !act().ended){
+    idle = 0;
+    // 画面偏差超限 → 对时（平时只往下顺播，不打断）
+    if (Math.abs(driftVid()) > DRIFT_MAX_VID){ logResync('drift'); resync(XFADE_DRIFT); }
+  } else {
+    idle += gap;                                            // 显示着但没在播：先累计
+    if (!busy && idle > 3 && act().readyState >= 2){        // 且顺手把它接上，别让画面卡住
+      const rp = act().play(); if (rp && rp.catch) rp.catch(function(){});
+    }
+  }
+  hudUpdate();
+}
+function hudUpdate(){
+  const d = new Date(Date.now() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const dr = driftSec();
+  const st = sunTimes(d);
+  const hm = function(x){ x = Math.round(x); return pad2(Math.floor(x/3600)) + ':' + pad2(Math.floor(x/60)%60); };
+  hud.textContent = (PREVIEW_ON ? '预览 ' : '当地 ') + d.toTimeString().slice(0,8)
+                  + '  ｜  位置 ' + LAT.toFixed(4) + '°' + (LAT >= 0 ? 'N' : 'S')
+                  + ' ' + Math.abs(LON).toFixed(4) + '°' + (LON >= 0 ? 'E' : 'W')
+                  + '  ｜  ' + tzLabel()
+                  + '  ｜  日出 ' + hm(st.rise) + '  日落 ' + hm(st.set)
+                  + '  ｜  片段 ' + (chunk+1) + '/' + NCHUNK
+                  + '  ｜  时刻偏差 ' + (dr >= 0 ? '+' : '-') + (Math.abs(dr)/60).toFixed(1)
+                  + '分 / ±' + (DRIFT_MAX/60) + ' 分'
+                  + '  ｜  今日对时 ' + resyncN + ' 次'
+                  + (busy ? '  ｜  对时中…' : (idle > IDLE_MAX ? '  ｜  待机' : ''));
+}
+setInterval(tick1s, 1000);
+
+/* 预览模式：算出把画面钉在“日出/日落 + PREVIEW_MIN 分钟”所需的偏移（小时） */
+if (PREVIEW_ON){
+  const n = new Date(Date.now() + tzShiftH*3600000);
+  const nowSec = n.getHours()*3600 + n.getMinutes()*60 + n.getSeconds();
+  const st = sunTimes(n);
+  let d = ((PREVIEW_ANCHOR === 'set' ? st.set : st.rise) + PREVIEW_MIN*60 - nowSec)/3600;
+  while (d >  12) d -= 24;
+  while (d < -12) d += 24;
+  previewShift = d;
+}
+
+/* 启动 */
+(function boot(){
+  const v = wrapTime(videoTimeFor(new Date()));
+  const k = chunkIndexFor(v);
+  play(k, v - BOUNDS[k], 0.01);
+})();
+
+document.addEventListener('visibilitychange', function(){ if (!document.hidden) tick1s(); });
+setTimeout(function(){ hud.style.opacity = 0; }, 10000);
+
+/* ===================== 事件清单：叠化 / 跳跃（调试用，默认关闭） =====================
+   每 250ms 采样一次画面位置，发现位置突变就记一条：
+     · 叠化 = 有过渡（busy 期间跨块/对时，画面是融过去的）
+     · 跳跃 = 没过渡的瞬时位移（原地 seek、硬切）
+   同时写 localStorage（键 evtLog），外部脚本可从磁盘读出来做统计。        */
+const SHOW_EVENT_LOG = false;                       // 要在页面上直接看到事件清单就改成 true
+const EVT_KEEP = 300;                               // 本地保留条数
+let evtLog = [];
+(function loadEvt(){
+  try {
+    const o = JSON.parse(localStorage.getItem('evtLog') || 'null');
+    if (o && o.ev) evtLog = o.ev;        // 跨天保留，只在超出 EVT_KEEP 时截断
+  } catch (e) {}
+})();
+const evtBox = SHOW_EVENT_LOG ? (function(){
+  const st = document.createElement('style');
+  st.textContent = '#evtBox{position:fixed;top:10px;left:12px;z-index:9;font:12px/1.6 Consolas,monospace;'
+    + 'color:#dde;text-shadow:0 1px 3px #000;background:rgba(6,10,18,.55);padding:8px 10px;'
+    + 'border-radius:6px;white-space:nowrap;pointer-events:none}';
+  document.head.appendChild(st);
+  const b = document.createElement('div');
+  b.id = 'evtBox';
+  document.body.appendChild(b);
+  return b;
+})() : null;
+/* 注意：事件日志跨天累积，不再按天清空（否则每天零点后旧数据会盖住新数据） */
+function pad2(n){ return String(n).padStart(2,'0'); }
+function hhmmss(ms){ const d = new Date(ms); return pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds()); }
+function logEvent(kind, reason, from, to){
+  let dVid = 0, dReal = 0;
+  if (from != null && to != null){
+    dVid  = ((to - from) % LOOP + LOOP*1.5) % LOOP - LOOP/2;          // 素材秒，取最短方向
+    let s = realSecFor(to) - realSecFor(from);
+    s = ((s + 43200 + 86400) % 86400) - 43200;                        // ±12 小时
+    dReal = s/60;
+  }
+  evtLog.push({ t: Date.now(), k: kind, r: reason, v: +dVid.toFixed(1), m: +dReal.toFixed(1) });
+  if (evtLog.length > EVT_KEEP) evtLog = evtLog.slice(-EVT_KEEP);
+  try { localStorage.setItem('evtLog', JSON.stringify({ ev: evtLog, day: DAY_KEY })); } catch (e) {}
+  drawEvt();
+}
+function drawEvt(){
+  if (!SHOW_EVENT_LOG || !evtBox) return;
+  evtBox.innerHTML = evtLog.slice(-9).reverse().map(function(e){
+    const c = e.k === '叠化' ? '#7fe3a1' : '#ffb454';
+    const sz = e.m ? ((e.m > 0 ? '+' : '') + e.m.toFixed(1) + ' 分') : '—';
+    return '<div><span style="color:#89a">' + hhmmss(e.t) + '</span>  '
+         + '<span style="color:' + c + '">' + e.k + '</span>  '
+         + '<span style="color:#ccd">' + e.r + '</span>  '
+         + '<span style="color:#eef">' + sz + '</span></div>';
+  }).join('');
+}
+/* 位置采样与突变判定 */
+let evPrev = null, lastBusyAt = 0;
+setInterval(function(){
+  if (chunk < 0) return;
+  if (busy) lastBusyAt = Date.now();                  // 记录“刚刚在过渡”，避免边界上误判
+  const pos = BOUNDS[chunk] + act().currentTime, now = Date.now();
+  const over = Math.abs(driftVid()) > DRIFT_MAX_VID;
+  if (evPrev){
+    const dt = (now - evPrev.t)/1000;
+    let d  = ((pos - evPrev.p) % LOOP + LOOP*1.5) % LOOP - LOOP/2;    // 有符号位移（素材秒）
+    const unexpected = Math.abs(d - dt) > 3;                          // 本该跟着 dt 走，偏离 >3 秒就是突变
+    if (unexpected && Math.abs(d) > 3){
+      const fading = busy || (now - lastBusyAt < 1200);               // 1.2 秒内有过过渡 = 叠化
+      const kind = fading ? '叠化' : '跳跃';
+      const why  = fading ? (chunk !== evPrev.c ? '跨块过渡' : '对时叠化')
+                          : (chunk !== evPrev.c ? '硬切换块' : '原地跳转');
+      logEvent(kind, why + (over ? '（偏差超限）' : ''), evPrev.p, pos);
+    }
+  } else {
+    logEvent('跳跃', '启动定位', null, pos);
+  }
+  evPrev = { p: pos, t: now, c: chunk };
+}, 250);
+drawEvt();
+
+/* ===================== Wallpaper Engine 属性面板 ===================== */
+/* 应用位置设置：只有值真的变了才重新对时（避免启动时白对一次） */
+function hudFlash(){
+  hudUpdate();
+  hud.style.opacity = 1;
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(function(){ hud.style.opacity = 0; }, 9000);
+}
+function applyLocation(p){
+  let changed = false;
+  if (p.latitude){
+    const v = parseCoord(p.latitude.value, 'lat');
+    if (isFinite(v) && v !== LAT){ LAT = v; changed = true; }
+  }
+  if (p.longitude){
+    const v = parseCoord(p.longitude.value, 'lon');
+    if (isFinite(v) && v !== LON){ LON = v; changed = true; }
+  }
+  if (p.timezone){
+    const t = String(p.timezone.value).trim();
+    let mode = TZ_MODE, man = TZ_MANUAL_MIN;
+    if (t === '' || t === 'auto'){ mode = 'auto'; man = null; }
+    else if (t === 'lookup'){ mode = 'lookup'; man = null; }
+    else { const h = parseFloat(t); if (isFinite(h)){ mode = 'manual'; man = Math.round(h*60); } }
+    if (mode !== TZ_MODE || man !== TZ_MANUAL_MIN){ TZ_MODE = mode; TZ_MANUAL_MIN = man; changed = true; }
+  }
+  if (!changed) return;
+  if (TZ_MODE === 'lookup'){ TZ_LOOK_MIN = null; TZ_LOOK_NAME = ''; TZ_LOOK_DST = false; }
+  updateTzShift();
+  logResync('loc');
+  resync(XFADE_SYNC);
+  hudFlash();
+  if (TZ_MODE === 'lookup') lookupTz();
+}
+let hudTimer = 0;
+
+/* lookup 模式下定期重查（跨夏令时切换后自动修正） */
+setInterval(function(){ if (TZ_MODE === 'lookup') lookupTz(); }, TZ_TTL);
+
+window.wallpaperPropertyListener = {
+  applyUserProperties: function (p) {
+    if (p.timeoffset){ offsetHours = p.timeoffset.value; logResync('offset'); resync(); }
+    if (p.latitude || p.longitude || p.timezone) applyLocation(p);
+  }
+};
+</script>
+</body>
+</html>

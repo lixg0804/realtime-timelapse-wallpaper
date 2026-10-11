@@ -1,0 +1,111 @@
+{
+	"contentrating" : "Everyone",
+	"description" : "通用实时昼夜壁纸：把一段「固定机位、完整昼夜循环」的延时/实拍视频，变成跟着你所在地真实太阳位置走的壁纸。画面进度跟随现实时间——日出、日落、正午、午夜都按你填的经纬度实时计算（NOAA 太阳位置算法）。\n\n前提：需要自备一段固定机位的昼夜循环素材，并按 README 切块放入本项目 chunks/ 目录、完成标定（详见 README.md）。\n\n用法：在属性面板里填经纬度即可切换城市；时区可选「跟随本机」「自动查询（联网反查 IANA 时区，含夏令时）」或手动 UTC 偏移。改完画面会立刻重新对时。",
+	"file" : "index.html",
+	"general" : 
+	{
+		"properties" : 
+		{
+			"latitude" : 
+			{
+				"index" : 0,
+				"order" : 100,
+				"text" : "纬度 -90~90（例 35.3 / -33.87 / 39.9042N）",
+				"type" : "textinput",
+				"value" : "35.3"
+			},
+			"longitude" : 
+			{
+				"index" : 1,
+				"order" : 101,
+				"text" : "经度 -180~180（例 -120.85 / 151.2093E）",
+				"type" : "textinput",
+				"value" : "-120.85"
+			},
+			"schemecolor" : 
+			{
+				"order" : 0,
+				"text" : "ui_browse_properties_scheme_color",
+				"type" : "color",
+				"value" : "0 0 0"
+			},
+			"timeoffset" : 
+			{
+				"index" : 3,
+				"max" : 12,
+				"min" : -12,
+				"order" : 103,
+				"step" : 0.25,
+				"text" : "时间偏移（小时）",
+				"type" : "slider",
+				"value" : 0
+			},
+			"timezone" : 
+			{
+				"index" : 2,
+				"options" : 
+				[
+					{
+						"label" : "跟随本机时区",
+						"value" : "auto"
+					},
+					{
+						"label" : "自动查询（联网·含夏令时）",
+						"value" : "lookup"
+					},
+					{
+						"label" : "UTC-8 洛杉矶",
+						"value" : "-8"
+					},
+					{
+						"label" : "UTC-5 纽约",
+						"value" : "-5"
+					},
+					{
+						"label" : "UTC+0 伦敦",
+						"value" : "0"
+					},
+					{
+						"label" : "UTC+1 巴黎/柏林",
+						"value" : "1"
+					},
+					{
+						"label" : "UTC+3 莫斯科",
+						"value" : "3"
+					},
+					{
+						"label" : "UTC+5:30 新德里",
+						"value" : "5.5"
+					},
+					{
+						"label" : "UTC+7 曼谷/雅加达",
+						"value" : "7"
+					},
+					{
+						"label" : "UTC+8 北京/新加坡",
+						"value" : "8"
+					},
+					{
+						"label" : "UTC+9 东京/首尔",
+						"value" : "9"
+					},
+					{
+						"label" : "UTC+10 悉尼",
+						"value" : "10"
+					}
+				],
+				"order" : 102,
+				"text" : "地点时区",
+				"type" : "combo",
+				"value" : "lookup"
+			}
+		}
+	},
+	"preview" : "preview.jpg",
+	"ratingsex" : "none",
+	"ratingviolence" : "none",
+	"tags" : [ "Timelapse" ],
+	"title" : "Real-time Day/Night Timelapse",
+	"type" : "web",
+	"version" : 0
+}
