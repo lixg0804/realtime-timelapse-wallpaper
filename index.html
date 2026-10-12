@@ -193,10 +193,7 @@ function applyTzResult(off, zone, dst){
   TZ_LOOK_MIN = off; TZ_LOOK_NAME = zone || ''; TZ_LOOK_DST = !!dst;
   updateTzShift();
   resync(XFADE_SYNC);
-  hudUpdate();
-  hud.style.opacity = 1;
-  clearTimeout(hudTimer);
-  hudTimer = setTimeout(function(){ hud.style.opacity = 0; }, 9000);
+  hudFlash();                                        // 刷新 HUD 并闪一下（与 applyLocation 共用同一条路）
 }
 function lookupTz(){
   if (TZ_MODE !== 'lookup') return;
@@ -570,7 +567,7 @@ function forward(){
   if (a.ended){ play(nx, 0, XFADE); return; }
   if (!isFinite(a.duration) || a.duration <= 0 || a.paused) return;
   const remain = a.duration - a.currentTime;
-  if (remain <= LEAD && prepped < 0){
+  if (remain <= LEAD && prepped !== nx){          // 预载的必须正好是"下一块"才算数（离开期间可能预载了别的块）
     const s = std();
     try { s.pause(); } catch (e) {}
     s.loop = false;
@@ -631,6 +628,7 @@ function hudUpdate(){
                   + '  ｜  片段 ' + (chunk+1) + '/' + NCHUNK
                   + '  ｜  时刻偏差 ' + (dr >= 0 ? '+' : '-') + (Math.abs(dr)/60).toFixed(1)
                   + '分 / ±' + (DRIFT_MAX/60) + ' 分'
+                  + '  ｜  触发量 ' + Math.round(Math.abs(driftVid())) + ' / ±' + DRIFT_MAX_VID + ' 素材秒'
                   + '  ｜  今日对时 ' + resyncN + ' 次'
                   + (busy ? '  ｜  对时中…' : (idle > IDLE_MAX ? '  ｜  待机' : ''));
 }
