@@ -18,6 +18,10 @@
 <video id="b" class="v" muted playsinline preload="auto"></video>
 <div id="hud">初始化…</div>
 <script>
+const hud = document.getElementById('hud');
+let hudTimer = 0;      // HUD 自动隐藏计时器（提前声明，避免被后面的函数引用时踩 TDZ）
+let dayKeyCur = '';    // 当前"当地日期"，用于跨天把对时计数归零
+
 /* ============================================================================
  *  realtime-timelapse-wallpaper —— 通用实时昼夜壁纸运行时
  *  ---------------------------------------------------------------------------
@@ -232,14 +236,8 @@ let previewShift     = 0;     // 自动算出的偏移（小时），无需手�
 /* ===================== 太阳时刻（NOAA） ===================== */
 function sunTimes(d){
   const rad = Math.PI/180;
-  const doy = Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())
-                          - Date.UTC(d.getFullYear(), 0, 0)) / 86400000);
-  const g = 2*Math.PI/365*(doy - 1 + 0.5);
-  const eqtime = 229.18*(0.000075 + 0.001868*Math.cos(g) - 0.032077*Math.sin(g)
-                - 0.014615*Math.cos(2*g) - 0.040849*Math.sin(2*g));
-  const decl = 0.006918 - 0.399912*Math.cos(g) + 0.070257*Math.sin(g)
-             - 0.006758*Math.cos(2*g) + 0.000907*Math.sin(2*g)
-             - 0.002697*Math.cos(3*g) + 0.001480*Math.sin(3*g);
+  const sp = sunParams(d);                                   // 与 sunParams 共用同一套 eqtime/decl，不再抄一遍
+  const eqtime = sp.eqtime, decl = sp.decl;
   const latR = LAT*rad;
   let cosHa = Math.cos(90.833*rad)/(Math.cos(latR)*Math.cos(decl)) - Math.tan(latR)*Math.tan(decl);
   cosHa = Math.max(-1, Math.min(1, cosHa));
@@ -266,8 +264,9 @@ function sunParams(d){
   };
 }
 function secOfDay(d){ return d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds() + d.getMilliseconds()/1000; }
-function sunAltRad(d){
-  const rad = Math.PI/180, sp = sunParams(d);
+function sunAltRad(d, sp){
+  const rad = Math.PI/180;
+  sp = sp || sunParams(d);         // 循环里反复调用时可把当天的 sp 传进来，省掉重复的三角函数
   let tst = (secOfDay(d)/60 + sp.eqtime + 4*LON - locOffMin()) % 1440;
   if (tst < 0) tst += 1440;                                  // 真太阳时（分钟）
   const ha = (tst/4 - 180)*rad, latR = LAT*rad;              // 时角（上午为负）
@@ -343,8 +342,12 @@ function videoTimeFor(now){
 }
 function chunkIndexFor(v){
   v = ((v % LOOP) + LOOP) % LOOP;
-  for (let i = 0; i < NCHUNK; i++) if (v < BOUNDS[i+1]) return i;
-  return NCHUNK - 1;
+  let lo = 0, hi = NCHUNK - 1;                              // BOUNDS 单调递增 → 二分
+  while (lo < hi){
+    const mid = (lo + hi) >> 1;
+    if (v < BOUNDS[mid+1]) hi = mid; else lo = mid + 1;
+  }
+  return lo;
 }
 /* 反查：某个素材位置“相当于现实几点”（返回当天秒数）——上文的映射取逆 */
 function realSecFor(v){
@@ -373,11 +376,12 @@ function realSecFor(v){
     t0 = s.set; t1 = mid; rising = false;
   }
   let lo = t0, hi = t1;                                     // 相位内高度角单调 → 二分反解
+  const y = d.getFullYear(), mo = d.getMonth(), da = d.getDate();
   for (let i = 0; i < 30; i++){
     const m = (lo + hi)/2;
-    const dm = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const dm = new Date(y, mo, da);
     dm.setSeconds(Math.floor(m));
-    const am = sunAltRad(dm)*180/Math.PI;
+    const am = sunAltRad(dm, sp)*180/Math.PI;                // sp 只跟"当天"有关，循环外算一次即可
     if ((am < A) === rising) lo = m; else hi = m;
   }
   return ((lo + hi)/2) % 86400;
@@ -405,24 +409,35 @@ function driftVid(){
 }
 
 /* ===================== 对时计数（按天，写 localStorage，页面重载也不丢） ===================== */
-const DAY_KEY = (function(){ const d = new Date(Date.now() + tzShiftH*3600000); return d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate(); })();
+function dayKey(){
+  const d = new Date(Date.now() + tzShiftH*3600000);
+  return d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate();
+}
+dayKeyCur = dayKey();
 let resyncN = 0, resyncLog = [];
 (function loadStat(){
   try {
     const o = JSON.parse(localStorage.getItem('resyncStat') || 'null');
-    if (o && o.day === DAY_KEY){ resyncN = o.n || 0; resyncLog = o.log || []; }
+    if (o && o.day === dayKeyCur){ resyncN = o.n || 0; resyncLog = o.log || []; }
   } catch (e) {}                                     // file:// 下不允许时静默降级
 })();
+/* 壁纸会连跑好几天，日期是加载时定死的 → 每次动计数前先看是否换天，换天就归零 */
+function dayRollover(){
+  const k = dayKey();
+  if (k === dayKeyCur) return;
+  dayKeyCur = k; resyncN = 0; resyncLog = [];
+  try { localStorage.setItem('resyncStat', JSON.stringify({ day: k, n: 0, log: [] })); } catch (e) {}
+}
 function logResync(kind){
+  dayRollover();
   resyncN++;
   resyncLog.push({ t: Date.now(), k: kind, dr: Math.round(driftSec()/60) });
   if (resyncLog.length > 300) resyncLog = resyncLog.slice(-300);
-  try { localStorage.setItem('resyncStat', JSON.stringify({ day: DAY_KEY, n: resyncN, log: resyncLog })); } catch (e) {}
+  try { localStorage.setItem('resyncStat', JSON.stringify({ day: dayKeyCur, n: resyncN, log: resyncLog })); } catch (e) {}
 }
 
 /* ===================== 播放引擎（双缓冲） ===================== */
 const EL = [document.getElementById('a'), document.getElementById('b')];
-const hud = document.getElementById('hud');
 let active = 0;        // 当前在播的元素
 let chunk  = -1;       // 当前块号
 let busy   = false;    // 正在切换中
@@ -449,6 +464,7 @@ function play(k, offset, xfade){
   const beginFade = function(){
     if (done) return;
     done = true;
+    n.onerror = null;                        // 已经出画面了，错误回调不再需要
     n.style.zIndex = 3;
     n.style.transitionDuration = xfade + 's';
     n.style.opacity = 1;
@@ -602,6 +618,7 @@ function tick1s(){
   hudUpdate();
 }
 function hudUpdate(){
+  dayRollover();
   const d = new Date(Date.now() + (offsetHours + previewShift + tzShiftH)*3600000);
   const dr = driftSec();
   const st = sunTimes(d);
@@ -678,7 +695,7 @@ function logEvent(kind, reason, from, to){
   }
   evtLog.push({ t: Date.now(), k: kind, r: reason, v: +dVid.toFixed(1), m: +dReal.toFixed(1) });
   if (evtLog.length > EVT_KEEP) evtLog = evtLog.slice(-EVT_KEEP);
-  try { localStorage.setItem('evtLog', JSON.stringify({ ev: evtLog, day: DAY_KEY })); } catch (e) {}
+  try { localStorage.setItem('evtLog', JSON.stringify({ ev: evtLog, day: dayKey() })); } catch (e) {}
   drawEvt();
 }
 function drawEvt(){
@@ -698,7 +715,6 @@ setInterval(function(){
   if (chunk < 0) return;
   if (busy) lastBusyAt = Date.now();                  // 记录“刚刚在过渡”，避免边界上误判
   const pos = BOUNDS[chunk] + act().currentTime, now = Date.now();
-  const over = Math.abs(driftVid()) > DRIFT_MAX_VID;
   if (evPrev){
     const dt = (now - evPrev.t)/1000;
     let d  = ((pos - evPrev.p) % LOOP + LOOP*1.5) % LOOP - LOOP/2;    // 有符号位移（素材秒）
@@ -708,6 +724,7 @@ setInterval(function(){
       const kind = fading ? '叠化' : '跳跃';
       const why  = fading ? (chunk !== evPrev.c ? '跨块过渡' : '对时叠化')
                           : (chunk !== evPrev.c ? '硬切换块' : '原地跳转');
+      const over = Math.abs(driftVid()) > DRIFT_MAX_VID;    // 只在真要记一条事件时才算
       logEvent(kind, why + (over ? '（偏差超限）' : ''), evPrev.p, pos);
     }
   } else {
@@ -751,14 +768,13 @@ function applyLocation(p){
   hudFlash();
   if (TZ_MODE === 'lookup') lookupTz();
 }
-let hudTimer = 0;
 
 /* lookup 模式下定期重查（跨夏令时切换后自动修正） */
 setInterval(function(){ if (TZ_MODE === 'lookup') lookupTz(); }, TZ_TTL);
 
 window.wallpaperPropertyListener = {
   applyUserProperties: function (p) {
-    if (p.timeoffset){ offsetHours = p.timeoffset.value; logResync('offset'); resync(); }
+    if (p.timeoffset){ offsetHours = Number(p.timeoffset.value) || 0; logResync('offset'); resync(); }
     if (p.latitude || p.longitude || p.timezone) applyLocation(p);
   }
 };
