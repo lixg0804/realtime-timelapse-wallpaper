@@ -248,17 +248,22 @@ function sunTimes(d){
 }
 
 /* ===================== 太阳高度角（真实，NOAA） ===================== */
+let _spKey = '', _spVal = null;
 function sunParams(d){
+  const key = d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate();
+  if (key === _spKey) return _spVal;               // 只跟"日期"有关 → 一格缓存，免得每秒被重复算十几次
   const doy = Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())
                           - Date.UTC(d.getFullYear(), 0, 0)) / 86400000);
   const g = 2*Math.PI/365*(doy - 1 + 0.5);
-  return {
+  _spKey = key;
+  _spVal = {
     eqtime: 229.18*(0.000075 + 0.001868*Math.cos(g) - 0.032077*Math.sin(g)
            - 0.014615*Math.cos(2*g) - 0.040849*Math.sin(2*g)),
     decl:   0.006918 - 0.399912*Math.cos(g) + 0.070257*Math.sin(g)
            - 0.006758*Math.cos(2*g) + 0.000907*Math.sin(2*g)
            - 0.002697*Math.cos(3*g) + 0.001480*Math.sin(3*g)
   };
+  return _spVal;
 }
 function secOfDay(d){ return d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds() + d.getMilliseconds()/1000; }
 function sunAltRad(d, sp){
@@ -311,8 +316,13 @@ function scaleAlt(A, a0, a1, b0, b1){              // 把 A 在 [a0,a1] 中的�
   return b0 + f*(b1 - b0);
 }
 function clamp01(x){ return x < 0 ? 0 : (x > 1 ? 1 : x); }
+/* "当地现在"：现实时间叠加 时间偏移 / 预览偏移 / 地点与本机的时区差。
+   不传参数 = 此刻；传 base 则以 base 为基准（videoTimeFor 要按传入的 now 算）。 */
+function locNow(base){
+  return new Date((base ? base.getTime() : Date.now()) + (offsetHours + previewShift + tzShiftH)*3600000);
+}
 function videoTimeFor(now){
-  const d = new Date(now.getTime() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const d = locNow(now);
   const sec = secOfDay(d);
   const s = sunTimes(d), sp = sunParams(d);
   const declD = sp.decl*180/Math.PI;
@@ -388,7 +398,7 @@ function realSecFor(v){
 function driftSec(){
   if (chunk < 0) return 0;
   const implied = realSecFor(wrapTime(BOUNDS[chunk] + act().currentTime));
-  const d = new Date(Date.now() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const d = locNow();
   const nowSec = d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds() + d.getMilliseconds()/1000;
   let diff = implied - nowSec;
   while (diff >  43200) diff -= 86400;
@@ -481,13 +491,13 @@ function play(k, offset, xfade){
     try { n.playbackRate = 1; } catch (e) {}
     const pr = n.play();
     // 必须等新图层真的吐出第一帧才开始淡入，否则会先黑一下
-    let gated = false;
-    const gate = function(){ if (gated) return; gated = true; beginFade(); };
+    let gated = false, gateTo = 0;
+    const gate = function(){ if (gated) return; gated = true; clearTimeout(gateTo); beginFade(); };
     if (n.requestVideoFrameCallback){
       n.requestVideoFrameCallback(gate);
-      setTimeout(gate, 500);
+      gateTo = setTimeout(gate, 500);
     } else {
-      setTimeout(gate, 150);
+      gateTo = setTimeout(gate, 150);
     }
     if (pr && pr.catch) pr.catch(gate);
   };
@@ -612,19 +622,20 @@ function tick1s(){
       const rp = act().play(); if (rp && rp.catch) rp.catch(function(){});
     }
   }
-  hudUpdate();
+  if (rendering) hudUpdate();                             // 真的没在显示时才跳过，省掉一次无谓的重算 + 写 DOM
 }
+/* 把"当天秒数"格式化成 HH:MM（提到 function 外，免得每秒新建一个闭包） */
+function hms(x){ x = Math.round(x); return pad2(Math.floor(x/3600)) + ':' + pad2(Math.floor(x/60)%60); }
 function hudUpdate(){
   dayRollover();
-  const d = new Date(Date.now() + (offsetHours + previewShift + tzShiftH)*3600000);
+  const d = locNow();
   const dr = driftSec();
   const st = sunTimes(d);
-  const hm = function(x){ x = Math.round(x); return pad2(Math.floor(x/3600)) + ':' + pad2(Math.floor(x/60)%60); };
   hud.textContent = (PREVIEW_ON ? '预览 ' : '当地 ') + d.toTimeString().slice(0,8)
                   + '  ｜  位置 ' + LAT.toFixed(4) + '°' + (LAT >= 0 ? 'N' : 'S')
                   + ' ' + Math.abs(LON).toFixed(4) + '°' + (LON >= 0 ? 'E' : 'W')
                   + '  ｜  ' + tzLabel()
-                  + '  ｜  日出 ' + hm(st.rise) + '  日落 ' + hm(st.set)
+                  + '  ｜  日出 ' + hms(st.rise) + '  日落 ' + hms(st.set)
                   + '  ｜  片段 ' + (chunk+1) + '/' + NCHUNK
                   + '  ｜  时刻偏差 ' + (dr >= 0 ? '+' : '-') + (Math.abs(dr)/60).toFixed(1)
                   + '分 / ±' + (DRIFT_MAX/60) + ' 分'
